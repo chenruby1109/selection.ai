@@ -1,6 +1,5 @@
 streamlit
-shioaji
+yfinance
 pandas
 pandas_ta
 requests
-yfinance
