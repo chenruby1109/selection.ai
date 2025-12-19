@@ -4,185 +4,147 @@ import pandas as pd
 import pandas_ta as ta
 import requests
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ==========================================
-# 1. 使用者設定區
+# 1. 系統設定
 # ==========================================
-# 請填入你的 Telegram Token (必填，否則收不到通知)
-TG_TOKEN = "你的_TELEGRAM_TOKEN" 
-TG_CHAT_ID = "你的_CHAT_ID"
+st.set_page_config(page_title="AI 趨勢訊號站", page_icon="📶", layout="wide")
 
-# 策略參數
-RSI_PERIOD = 14
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD = 30
-MA_PERIOD = 60 # 60分K的季線，或是1分K的60MA，作為趨勢線
+# 從 Streamlit Secrets 讀取 Token (稍後教你設定，這樣最安全)
+try:
+    TG_TOKEN = st.secrets["TG_TOKEN"]
+    TG_CHAT_ID = st.secrets["TG_CHAT_ID"]
+except:
+    st.error("⚠️ 請在 Streamlit Cloud 設定 Secrets，否則無法發送通知")
+    TG_TOKEN = ""
+    TG_CHAT_ID = ""
 
 # ==========================================
-# 2. 爬蟲與數據獲取模組 (免費來源)
+# 2. 核心功能
 # ==========================================
 
-def get_free_market_data():
-    """
-    獲取台股加權指數 (^TWII) 即時數據 (延遲約 0-15分鐘)
-    以此作為台指期 (TXF) 的替代分析標的
-    """
+def get_data():
+    """抓取加權指數數據"""
     try:
-        # 下載當日 1分K 資料
-        df = yf.download(tickers="^TWII", period="1d", interval="1m", progress=False)
+        # 抓取 5天 的 5分K
+        df = yf.download(tickers="^TWII", period="5d", interval="5m", progress=False)
+        if df.empty: return None
         
-        if df.empty:
-            return None, "No Data"
-
-        # 重整資料格式
+        # 格式整理
         df.reset_index(inplace=True)
-        df.columns = ['Datetime', 'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
-        df.set_index('Datetime', inplace=True)
-        
-        return df, "Success"
+        # yfinance 欄位有時會是多層索引，這裡做簡單處理
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+            
+        df.rename(columns={"Datetime": "ts", "Date": "ts"}, inplace=True)
+        df.set_index("ts", inplace=True)
+        return df
     except Exception as e:
-        return None, str(e)
+        st.error(f"數據抓取失敗: {e}")
+        return None
 
-def analyze_chips_proxy(df):
-    """
-    因為沒有付費籌碼源，我們用 '價量關係' 模擬籌碼強度
-    """
-    # 計算成交量變化 (Volume Delta)
-    vol_ma = df['Volume'].rolling(5).mean()
-    current_vol = df['Volume'].iloc[-1]
-    
-    # 簡單的籌碼假設：出量上漲=主力買，出量下跌=主力賣
-    if current_vol > vol_ma.iloc[-1] * 1.5:
-        return "🔥 爆量 (主力進場)"
-    elif current_vol < vol_ma.iloc[-1] * 0.5:
-        return "❄️ 量縮 (觀望)"
-    else:
-        return "☁️ 正常量"
-
-# ==========================================
-# 3. 訊號發送模組
-# ==========================================
-
-def send_telegram(message):
-    if "你的" in TG_TOKEN:
-        st.toast("⚠️ 未設定 Telegram Token，無法發送")
-        return
-    
+def send_telegram(msg):
+    """發送 TG 通知"""
+    if not TG_TOKEN: return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    try:
-        requests.post(url, json=payload, timeout=3)
-    except Exception as e:
-        st.error(f"TG 發送錯誤: {e}")
+    payload = {"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+    requests.post(url, json=payload)
 
-# ==========================================
-# 4. 策略核心 (高勝率邏輯)
-# ==========================================
-
-def strategy_engine(df, manual_pcr=100):
+def strategy(df, pcr_view):
     """
-    df: 價格數據
-    manual_pcr: 手動輸入的 Put/Call Ratio (因為這很難爬，建議手動參考)
+    高勝率策略:
+    1. 布林通道 (逆勢)
+    2. RSI (動能)
+    3. PCR 濾網 (手動輸入的籌碼觀點)
     """
-    if len(df) < MA_PERIOD:
-        return "WAIT", 0.0
-
     # 計算指標
-    df.ta.rsi(length=RSI_PERIOD, append=True)
-    df.ta.sma(length=MA_PERIOD, append=True)
+    df.ta.bbands(length=20, std=2, append=True)
+    df.ta.rsi(length=14, append=True)
     
-    # 取得最新數據
     last = df.iloc[-1]
-    rsi = last[f'RSI_{RSI_PERIOD}']
-    ma = last[f'SMA_{MA_PERIOD}']
-    close = last['Close']
+    close = last["Close"]
+    rsi = last["RSI_14"]
+    upper = last["BBU_20_2.0"]
+    lower = last["BBL_20_2.0"]
     
     signal = "WAIT"
+    reason = ""
     
-    # === 高勝率邏輯：順大勢 (MA + PCR) + 逆小勢 (RSI) ===
-    
-    # 狀況 A: 趨勢向上 (價在MA上) + 籌碼偏多 (PCR > 100) + 短線拉回 (RSI超賣)
-    # 這是勝率最高的 Buy Call 點 (拉回買進)
-    if close > ma and manual_pcr > 100 and rsi < RSI_OVERSOLD:
-        signal = "BUY_CALL"
-        
-    # 狀況 B: 趨勢向下 (價在MA下) + 籌碼偏空 (PCR < 100) + 短線反彈 (RSI超買)
-    # 這是勝率最高的 Buy Put 點 (反彈空)
-    elif close < ma and manual_pcr < 100 and rsi > RSI_OVERBOUGHT:
-        signal = "BUY_PUT"
-        
-    return signal, rsi, close
+    # === 訊號邏輯 ===
+    # 買 CALL 條件: 跌破下軌 + RSI超賣 + 籌碼偏多
+    if close < lower and rsi < 30:
+        if pcr_view == "偏多":
+            signal = "BUY_CALL"
+            reason = "📉 跌破下軌 + RSI超賣 + 籌碼支撐"
+        else:
+            reason = "⚠️ 技術面落底，但籌碼不佳，建議觀望"
+            
+    # 買 PUT 條件: 突破上軌 + RSI超買 + 籌碼偏空
+    elif close > upper and rsi > 70:
+        if pcr_view == "偏空":
+            signal = "BUY_PUT"
+            reason = "📈 突破上軌 + RSI超買 + 籌碼壓力"
+        else:
+            reason = "⚠️ 技術面過熱，但籌碼強勢，建議觀望"
+
+    return signal, close, rsi, reason
 
 # ==========================================
-# 5. Streamlit 主程式
+# 3. 前端介面
 # ==========================================
-
-st.set_page_config(page_title="免費籌碼即時掃描", layout="wide", page_icon="🕵️")
-
-st.title("🕵️ 選擇權籌碼狙擊手 (免費版)")
+st.title("📶 選擇權訊號戰情室 (雲端版)")
 st.markdown("---")
 
-# 側邊欄：輸入籌碼濾網
+# 側邊欄設定
 with st.sidebar:
-    st.header("1. 籌碼濾網 (必填)")
-    st.info("由於 PCR 數據無法免費即時爬取，請參考期交所網頁後手動調整，以增加勝率。")
-    pcr_input = st.slider("目前市場 Put/Call Ratio (%)", 50, 150, 100)
+    st.header("🕵️ 人工籌碼濾網")
+    st.info("由於免費源沒有即時籌碼，請根據盤前資訊設定今日方向，以提高勝率。")
+    pcr_option = st.radio("今日大戶籌碼/PCR看法:", ["偏多 (看漲)", "中立 (盤整)", "偏空 (看跌)"])
     
-    st.header("2. 控制中心")
-    run_bot = st.checkbox("啟動即時監控", value=False)
-    refresh_rate = st.number_input("刷新頻率 (秒)", 30, 300, 60)
+    pcr_map = {"偏多 (看漲)": "偏多", "中立 (盤整)": "中立", "偏空 (看跌)": "偏空"}
+    user_view = pcr_map[pcr_option]
+    
+    st.divider()
+    auto_refresh = st.checkbox("開啟自動刷新 (每60秒)", value=True)
 
-# 主面板
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("📊 加權指數走勢 (模擬台指期)")
-    chart_spot = st.empty()
-with col2:
-    st.subheader("🔔 即時訊號日誌")
-    log_spot = st.empty()
-
-if "logs" not in st.session_state:
-    st.session_state.logs = []
-
-# 執行迴圈
-if run_bot:
-    while True:
-        with st.spinner("正在分析市場數據..."):
-            # 1. 抓取資料
-            df, status = get_free_market_data()
+# 主畫面
+if st.button("🔄 立即分析市場") or auto_refresh:
+    
+    with st.spinner("正在連線 Yahoo Finance 分析中..."):
+        df = get_data()
+        
+        if df is not None:
+            sig, price, rsi_val, note = strategy(df, user_view)
             
-            if df is not None:
-                # 2. 畫圖
-                chart_spot.line_chart(df['Close'])
-                
-                # 3. 分析籌碼與訊號
-                chip_status = analyze_chips_proxy(df)
-                signal, rsi_val, current_price = strategy_engine(df, manual_pcr=pcr_input)
-                
-                # 顯示資訊
-                now_time = datetime.now().strftime("%H:%M:%S")
-                st.metric(label=f"更新時間 {now_time}", value=f"{current_price:.2f}", delta=chip_status)
-                
-                # 4. 觸發警報
-                if signal != "WAIT":
-                    msg = f"🚀 {signal} 訊號觸發！\n⏰ 時間: {now_time}\n💰 價格: {current_price}\n📊 RSI: {rsi_val:.2f}\n⚖️ PCR設定: {pcr_input}%"
+            # 顯示大字報
+            col1, col2, col3 = st.columns(3)
+            col1.metric("加權指數", f"{price:.0f}")
+            col2.metric("RSI 強度", f"{rsi_val:.1f}")
+            col3.metric("目前訊號", sig, delta_color="inverse")
+            
+            # 走勢圖
+            st.line_chart(df["Close"])
+            
+            # 訊號處理
+            if sig == "BUY_CALL":
+                st.success(f"🔥 強力訊號: {note}")
+                # 只有當最後一筆是新訊號時才發送 (簡單防重複機制可再優化)
+                if "last_sig" not in st.session_state or st.session_state.last_sig != str(price):
+                    send_telegram(f"🚀 **進場通知** 🚀\n建議: 買進 CALL\n價格: {price:.0f}\nRSI: {rsi_val:.1f}\n理由: {note}")
+                    st.session_state.last_sig = str(price)
                     
-                    # 避免重複發送 (簡單濾網: 如果最後一條log跟現在一樣就不發)
-                    if not st.session_state.logs or st.session_state.logs[0] != msg:
-                        st.session_state.logs.insert(0, msg)
-                        send_telegram(msg)
-                        st.toast(f"已發送 Telegram: {signal}")
-                
-                # 更新 Log 顯示
-                log_spot.table(pd.DataFrame(st.session_state.logs, columns=["訊號紀錄"]))
-                
+            elif sig == "BUY_PUT":
+                st.error(f"❄️ 強力訊號: {note}")
+                if "last_sig" not in st.session_state or st.session_state.last_sig != str(price):
+                    send_telegram(f"🔻 **進場通知** 🔻\n建議: 買進 PUT\n價格: {price:.0f}\nRSI: {rsi_val:.1f}\n理由: {note}")
+                    st.session_state.last_sig = str(price)
             else:
-                st.error("獲取資料失敗，可能是盤後或網路問題。")
-            
-            time.sleep(refresh_rate)
-            st.experimental_rerun()
+                st.info(f"👀 目前觀望: {note}")
+                
+        else:
+            st.warning("暫時無法取得數據，請稍後重試")
+
+    if auto_refresh:
+        time.sleep(60)
+        st.rerun()
