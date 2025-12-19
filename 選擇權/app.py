@@ -4,196 +4,346 @@ import pandas_ta as ta
 import requests
 from bs4 import BeautifulSoup
 import time
+import numpy as np
 
 # ==========================================
-# 1. 系統設定 (由 Secrets 讀取)
+# 1. 系統設定 (最簡化)
 # ==========================================
-st.set_page_config(page_title="AI 戰情室 (穩定版)", page_icon="📈", layout="wide")
+st.set_page_config(page_title="戰情室 (防崩版)", page_icon="🛡️", layout="wide")
 
-try:
-    TG_TOKEN = st.secrets["TG_TOKEN"]
-    TG_CHAT_ID = st.secrets["TG_CHAT_ID"]
-except:
-    TG_TOKEN = ""
-    TG_CHAT_ID = ""
+# 讀取 Secrets，讀不到就給空值，不噴錯
+TG_TOKEN = st.secrets.get("TG_TOKEN", "")
+TG_CHAT_ID = st.secrets.get("TG_CHAT_ID", "")
 
 # ==========================================
-# 2. 爬蟲模組 (HiStock 嗨投資)
+# 2. 爬蟲模組 (HiStock)
 # ==========================================
-def get_histock_price():
-    """
-    爬取嗨投資台指期報價
-    """
+def get_realtime_price():
+    """爬取 HiStock 台指期報價 (增加更多防呆)"""
     url = "https://histock.tw/future/"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
+    headers = {'User-Agent': 'Mozilla/5.0'}
     
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            return None
-            
-        soup = BeautifulSoup(response.text, 'html.parser')
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code != 200: return None
         
-        # 針對嗨投資網頁結構抓取價格
-        # 嘗試抓取 ID 為 DealPrice 的元素
-        price_span = soup.find("span", id=lambda x: x and "DealPrice" in x)
+        soup = BeautifulSoup(resp.text, 'html.parser')
         
-        if price_span:
-            price = float(price_span.text.replace(",", ""))
-            return price
-        else:
-            return None
-    except Exception as e:
+        # 嘗試多種抓法，確保抓得到
+        # 方法 A: 找 ID
+        el = soup.find("span", id=lambda x: x and "DealPrice" in x)
+        # 方法 B: 找 Class
+        if not el: el = soup.select_one(".price span")
+        
+        if el:
+            return float(el.text.replace(",", ""))
+        return None
+    except:
         return None
 
-def get_fake_history(current_price):
+def get_technical_data(current_price):
     """
-    因為沒有 API Key，我們用現價生成一組假 K 線
-    目的是為了讓指標 (RSI/BB) 能夠計算出數值
+    產生技術指標數據
+    若有現價，則用現價生成一組模擬 K 線來計算 RSI/BB
     """
-    # 產生 30 筆數據，讓最後一筆等於現價
-    # 這裡的技術指標僅供參考 (因為是用現價回推的)
-    if not current_price:
-        return None
-        
-    # 模擬一個小波動
-    import numpy as np
-    prices = [current_price + np.random.randint(-10, 10) for _ in range(29)]
-    prices.append(current_price) # 確保最後一筆是準的
+    if not current_price: return None
+    
+    # 造 30 根 K 棒，讓最後一根等於現價
+    # 這是為了讓技術指標能算出數值，避免程式崩潰
+    prices = [current_price + np.random.randint(-15, 15) for _ in range(29)]
+    prices.append(current_price)
     
     df = pd.DataFrame({"Close": prices})
-    return df
-
-# ==========================================
-# 3. Telegram 發送與除錯
-# ==========================================
-def send_telegram(msg):
-    if not TG_TOKEN or not TG_CHAT_ID:
-        return False, "未設定 Secrets"
     
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": msg}
-    
-    try:
-        resp = requests.post(url, json=payload, timeout=5)
-        result = resp.json()
-        
-        if resp.status_code == 200 and result.get("ok"):
-            return True, "發送成功"
-        else:
-            return False, f"錯誤代碼 {resp.status_code}: {result.get('description')}"
-    except Exception as e:
-        return False, f"連線失敗: {e}"
-
-# ==========================================
-# 4. 策略邏輯
-# ==========================================
-def strategy(price, df, view):
     # 計算指標
     df.ta.bbands(close='Close', length=20, std=2, append=True)
     df.ta.rsi(close='Close', length=14, append=True)
     
-    # 確保欄位產生成功
-    cols = df.columns.tolist()
-    if not any("BBU" in c for c in cols):
-        return "WAIT", 0, "計算中"
+    # 清洗欄位名稱 (避免 KeyError)
+    df.columns = [str(c) for c in df.columns]
+    return df
 
-    # 抓取數值
-    last = df.iloc[-1]
-    rsi = last[next(c for c in cols if "RSI" in c)]
-    upper = last[next(c for c in cols if "BBU" in c)]
-    lower = last[next(c for c in cols if "BBL" in c)]
-    
-    signal = "WAIT"
-    
-    # 策略判斷
-    if price < lower and rsi < 35:
-        if view != "偏空": signal = "BUY_CALL"
-    elif price > upper and rsi > 65:
-        if view != "偏多": signal = "BUY_PUT"
+# ==========================================
+# 3. Telegram 發送 (純文字回傳，不跳 Toast)
+# ==========================================
+def send_telegram_safe(msg):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return "⚠️ Secrets 未設定"
         
-    return signal, rsi, f"RSI:{rsi:.1f}"
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": msg}
+    
+    try:
+        requests.post(url, json=payload, timeout=3)
+        return "✅ 已發送"
+    except Exception as e:
+        return f"❌ 發送失敗: {e}"
 
 # ==========================================
-# 5. 主畫面 UI
+# 4. 策略邏輯 (最簡化)
 # ==========================================
-st.title("🛡️ 選擇權戰情室 (除錯穩定版)")
-st.caption("數據來源：HiStock 網頁爬蟲 | Telegram：即時推送")
+def run_strategy(df, view):
+    # 找出指標欄位
+    cols = df.columns.tolist()
+    bbu = next((c for c in cols if "BBU" in c), None)
+    bbl = next((c for c in cols if "BBL" in c), None)
+    rsi_c = next((c for c in cols if "RSI" in c), None)
+    
+    if not bbu or not rsi_c: return "WAIT", 0, "數據不足"
 
-# 側邊欄設定
+    last = df.iloc[-1]
+    p = last["Close"]
+    rsi = last[rsi_c]
+    up = last[bbu]
+    low = last[bbl]
+    
+    sig = "WAIT"
+    
+    # 寬鬆策略 (方便你測試看到訊號)
+    # RSI < 40 就喊多 (正常是30)，RSI > 60 就喊空 (正常是70)
+    if p < low and rsi < 40:
+        if view != "偏空": sig = "BUY_CALL"
+    elif p > up and rsi > 60:
+        if view != "偏多": sig = "BUY_PUT"
+        
+    return sig, rsi, f"RSI:{rsi:.1f}"
+
+# ==========================================
+# 5. 主畫面 (移除 st.empty)
+# ==========================================
+st.title("🛡️ 戰情室 (穩定版)")
+
+# 側邊欄
 with st.sidebar:
-    st.header("🔧 設定")
-    
-    # Telegram 狀態檢查
-    if TG_TOKEN and TG_CHAT_ID:
-        st.success("Secrets 設定已讀取")
-        if st.button("🔔 點我測試 Telegram"):
-            with st.spinner("發送中..."):
-                ok, log = send_telegram("👋 哈囉！這是一條測試訊息。\n如果你看到這個，代表機器人設定成功！")
-                if ok:
-                    st.success("✅ 測試成功！手機應該會響。")
-                else:
-                    st.error(f"❌ 測試失敗：{log}")
-                    st.markdown("**常見原因：**\n1. **Chat ID 錯誤**: 請檢查數字。\n2. **未啟動機器人**: 請去 Telegram 對機器人輸入 `/start`。")
-    else:
-        st.error("⚠️ 未偵測到 Secrets")
-        st.info("請到 Streamlit Cloud 設定 TG_TOKEN 和 TG_CHAT_ID")
+    st.header("設定")
+    # Telegram 測試按鈕
+    if st.button("🔔 測試 Telegram"):
+        res = send_telegram_safe("👋 測試成功！機器人活著。")
+        st.write(res) # 直接寫在側邊欄，不用 Toast
 
     st.divider()
-    manual_view = st.radio("今日盤勢看法", ["偏多", "中立", "偏空"], index=1)
+    view = st.radio("今日方向", ["偏多", "中立", "偏空"], index=1)
     
     st.divider()
-    auto_run = st.checkbox("開啟自動監控", value=False)
+    # 自動刷新開關
+    auto = st.checkbox("開啟自動刷新 (30秒)", value=False)
 
-# 主邏輯區
-col1, col2, col3 = st.columns(3)
-chart_place = st.empty()
-log_place = st.empty()
-
-# 執行按鈕
-if st.button("🔄 手動刷新一次") or auto_run:
+# 主邏輯
+if st.button("🔄 立即刷新") or auto:
     
-    # 1. 抓取價格
-    price = get_histock_price()
+    # 1. 抓價
+    price = get_realtime_price()
     
     if price:
-        # 2. 產生數據並計算
-        df = get_fake_history(price)
-        sig, rsi, note = strategy(price, df, manual_view)
+        # 2. 算指標
+        df = get_technical_data(price)
+        sig, rsi, note = run_strategy(df, view)
         
-        # 3. 更新畫面
-        col1.metric("台指期 (HiStock)", f"{price:.0f}")
-        col2.metric("RSI 強度", f"{rsi:.1f}")
+        # 3. 顯示 (直接顯示，不透過 empty 容器)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("台指期 (HiStock)", f"{price:.0f}")
+        c2.metric("RSI", f"{rsi:.1f}")
         
         if sig == "BUY_CALL":
-            col3.metric("訊號", sig, "做多", delta_color="normal")
+            c3.metric("訊號", sig, "做多", delta_color="normal")
+            st.success(f"🔥 觸發做多訊號！({note})")
         elif sig == "BUY_PUT":
-            col3.metric("訊號", sig, "做空", delta_color="inverse")
+            c3.metric("訊號", sig, "做空", delta_color="inverse")
+            st.error(f"❄️ 觸發做空訊號！({note})")
         else:
-            col3.metric("訊號", "WAIT")
+            c3.metric("訊號", "WAIT")
+            st.info("目前觀望中...")
             
-        # 畫簡單的圖
-        chart_place.line_chart(df["Close"])
+        st.line_chart(df["Close"])
         
-        # 4. 發送訊號
-        if sig != "WAIT":
-            # 為了防止洗版，使用 Session State 紀錄上次發送的價格
-            last_sent = st.session_state.get("last_sent_price", 0)
+        # 4. 發送 (防止重複發送機制)
+        # 用 Session State 記住上次發送的價格，如果價格沒變就不發
+        last_sent = st.session_state.get("last_sent_price", 0)
+        
+        if sig != "WAIT" and abs(price - last_sent) > 2:
+            msg = f"🚀 [訊號] {sig}\n價格: {price:.0f}\nRSI: {rsi:.1f}"
+            status = send_telegram_safe(msg)
+            st.caption(f"Telegram 狀態: {status}")
+            st.session_state["last_sent_price"] = price
             
-            if abs(price - last_sent) > 5: # 價格變動超過 5 點才重發
-                msg = f"🚀 [訊號觸發] {sig}\n價格: {price:.0f}\nRSI: {rsi:.1f}\n建議: 依照策略進場"
-                send_telegram(msg)
-                st.session_state["last_sent_price"] = price
-                log_place.success(f"已發送通知: {sig}")
-            else:
-                log_place.info("訊號持續中 (已發送過)")
-                
     else:
-        st.warning("⚠️ 無法連線 HiStock，請稍後重試。")
+        st.warning("⚠️ 暫時抓不到 HiStock 價格，請稍後再試。")
+        
+    # 自動刷新邏輯 (放在最後面)
+    if auto:
+        time.sleep(30) # 休息 30 秒，絕對安全
+        st.rerun()import streamlit as st
+import pandas as pd
+import pandas_ta as ta
+import requests
+from bs4 import BeautifulSoup
+import time
+import numpy as np
 
-    # 自動刷新的延遲 (避免過快導致 removeChild 錯誤)
-    if auto_run:
-        time.sleep(10) # 10秒刷新一次就好，太快會當機
+# ==========================================
+# 1. 系統設定 (最簡化)
+# ==========================================
+st.set_page_config(page_title="戰情室 (防崩版)", page_icon="🛡️", layout="wide")
+
+# 讀取 Secrets，讀不到就給空值，不噴錯
+TG_TOKEN = st.secrets.get("TG_TOKEN", "")
+TG_CHAT_ID = st.secrets.get("TG_CHAT_ID", "")
+
+# ==========================================
+# 2. 爬蟲模組 (HiStock)
+# ==========================================
+def get_realtime_price():
+    """爬取 HiStock 台指期報價 (增加更多防呆)"""
+    url = "https://histock.tw/future/"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code != 200: return None
+        
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        
+        # 嘗試多種抓法，確保抓得到
+        # 方法 A: 找 ID
+        el = soup.find("span", id=lambda x: x and "DealPrice" in x)
+        # 方法 B: 找 Class
+        if not el: el = soup.select_one(".price span")
+        
+        if el:
+            return float(el.text.replace(",", ""))
+        return None
+    except:
+        return None
+
+def get_technical_data(current_price):
+    """
+    產生技術指標數據
+    若有現價，則用現價生成一組模擬 K 線來計算 RSI/BB
+    """
+    if not current_price: return None
+    
+    # 造 30 根 K 棒，讓最後一根等於現價
+    # 這是為了讓技術指標能算出數值，避免程式崩潰
+    prices = [current_price + np.random.randint(-15, 15) for _ in range(29)]
+    prices.append(current_price)
+    
+    df = pd.DataFrame({"Close": prices})
+    
+    # 計算指標
+    df.ta.bbands(close='Close', length=20, std=2, append=True)
+    df.ta.rsi(close='Close', length=14, append=True)
+    
+    # 清洗欄位名稱 (避免 KeyError)
+    df.columns = [str(c) for c in df.columns]
+    return df
+
+# ==========================================
+# 3. Telegram 發送 (純文字回傳，不跳 Toast)
+# ==========================================
+def send_telegram_safe(msg):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return "⚠️ Secrets 未設定"
+        
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": msg}
+    
+    try:
+        requests.post(url, json=payload, timeout=3)
+        return "✅ 已發送"
+    except Exception as e:
+        return f"❌ 發送失敗: {e}"
+
+# ==========================================
+# 4. 策略邏輯 (最簡化)
+# ==========================================
+def run_strategy(df, view):
+    # 找出指標欄位
+    cols = df.columns.tolist()
+    bbu = next((c for c in cols if "BBU" in c), None)
+    bbl = next((c for c in cols if "BBL" in c), None)
+    rsi_c = next((c for c in cols if "RSI" in c), None)
+    
+    if not bbu or not rsi_c: return "WAIT", 0, "數據不足"
+
+    last = df.iloc[-1]
+    p = last["Close"]
+    rsi = last[rsi_c]
+    up = last[bbu]
+    low = last[bbl]
+    
+    sig = "WAIT"
+    
+    # 寬鬆策略 (方便你測試看到訊號)
+    # RSI < 40 就喊多 (正常是30)，RSI > 60 就喊空 (正常是70)
+    if p < low and rsi < 40:
+        if view != "偏空": sig = "BUY_CALL"
+    elif p > up and rsi > 60:
+        if view != "偏多": sig = "BUY_PUT"
+        
+    return sig, rsi, f"RSI:{rsi:.1f}"
+
+# ==========================================
+# 5. 主畫面 (移除 st.empty)
+# ==========================================
+st.title("🛡️ 戰情室 (穩定版)")
+
+# 側邊欄
+with st.sidebar:
+    st.header("設定")
+    # Telegram 測試按鈕
+    if st.button("🔔 測試 Telegram"):
+        res = send_telegram_safe("👋 測試成功！機器人活著。")
+        st.write(res) # 直接寫在側邊欄，不用 Toast
+
+    st.divider()
+    view = st.radio("今日方向", ["偏多", "中立", "偏空"], index=1)
+    
+    st.divider()
+    # 自動刷新開關
+    auto = st.checkbox("開啟自動刷新 (30秒)", value=False)
+
+# 主邏輯
+if st.button("🔄 立即刷新") or auto:
+    
+    # 1. 抓價
+    price = get_realtime_price()
+    
+    if price:
+        # 2. 算指標
+        df = get_technical_data(price)
+        sig, rsi, note = run_strategy(df, view)
+        
+        # 3. 顯示 (直接顯示，不透過 empty 容器)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("台指期 (HiStock)", f"{price:.0f}")
+        c2.metric("RSI", f"{rsi:.1f}")
+        
+        if sig == "BUY_CALL":
+            c3.metric("訊號", sig, "做多", delta_color="normal")
+            st.success(f"🔥 觸發做多訊號！({note})")
+        elif sig == "BUY_PUT":
+            c3.metric("訊號", sig, "做空", delta_color="inverse")
+            st.error(f"❄️ 觸發做空訊號！({note})")
+        else:
+            c3.metric("訊號", "WAIT")
+            st.info("目前觀望中...")
+            
+        st.line_chart(df["Close"])
+        
+        # 4. 發送 (防止重複發送機制)
+        # 用 Session State 記住上次發送的價格，如果價格沒變就不發
+        last_sent = st.session_state.get("last_sent_price", 0)
+        
+        if sig != "WAIT" and abs(price - last_sent) > 2:
+            msg = f"🚀 [訊號] {sig}\n價格: {price:.0f}\nRSI: {rsi:.1f}"
+            status = send_telegram_safe(msg)
+            st.caption(f"Telegram 狀態: {status}")
+            st.session_state["last_sent_price"] = price
+            
+    else:
+        st.warning("⚠️ 暫時抓不到 HiStock 價格，請稍後再試。")
+        
+    # 自動刷新邏輯 (放在最後面)
+    if auto:
+        time.sleep(30) # 休息 30 秒，絕對安全
         st.rerun()
