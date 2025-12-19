@@ -1,7 +1,6 @@
 streamlit
-yfinance
+shioaji
 pandas
-numpy
+pandas_ta
 requests
-scipy
-streamlit-autorefresh
+yfinance
